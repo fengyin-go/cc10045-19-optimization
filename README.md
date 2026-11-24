@@ -76,8 +76,37 @@ npm run dev
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
 - 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
-- 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
+- 列表接口统一返回 `{ items, total, page, size, anchor_id }`。`anchor_id` 是首屏
+  结果集的 id 上界，翻页时原样回传，期间新插入的记录不会挤掉已看过的页。
+- 动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 异常归因的证据筛选
+
+告警历史是归因的唯一证据来源：每条 `alert_log` 在触发时绑定 `metric_value_id`
+（指标采样）、`rule_id`、`duty_group`（归属值班组）。相关接口：
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/alert_policy/history?rule_id=&metric_value_id=` | 按触发规则检索告警历史，支持 `anchor_id` 翻页 |
+| `POST /api/alert_policy/{alert_id}/trigger` | 按指定 `metric_value_id` 登记一次触发证据 |
+| `GET /api/anomaly_analysis/evidence?alert_log_id=&duty_group=` | 工作台：证据 + 已有归因 + 可认领 / 需自建 |
+| `GET /api/anomaly_analysis/rule/{rule_id}/history` | 从自己的规则历史打开筛选结果 |
+| `POST /api/anomaly_analysis/from-evidence` | 以证据登记归因记录 |
+| `POST /api/anomaly_analysis/{id}/claim` | 认领相同证据，另存本组记录 |
+| `GET /api/anomaly_analysis?rule_id=&metric_value_id=&alert_log_id=` | 归因列表按证据精确过滤 |
+
+可靠性规则：
+
+- 证据只按精确 id（`metric_value_id` / `alert_log_id` / `rule_id`）绑定和过滤，
+  不按指标名称或时间字符串匹配，同名指标、同一分钟的两个采样不会串位。
+- 每条归因记录都保存它实际取用的 `metric_value_id`；`启动分析` 固定使用该采样，
+  不会换成同名指标的最新值。
+- 认领相同证据时另存一条本组记录，源记录（如渠道值班已办理的那条）的办理人和
+  来源保持不变；同一组重复认领幂等。
+- 翻页使用 `anchor_id`，后插入的样本不会挤掉当时可办理的记录。
+
+回归测试：`PYTHONPATH=backend backend/.venv/bin/python backend/tests/test_anomaly_evidence.py`
 
 领域：数据工程
 子方向：数据分析与数据应用

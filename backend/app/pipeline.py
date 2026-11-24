@@ -596,35 +596,59 @@ def compute_retention(task: dict[str, Any]) -> list[dict[str, Any]]:
 def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
     """对指定指标执行多维度异常检测和归因分析。
 
+    优先使用 analysis 中绑定的 metric_value_id 作为"当前值"，保证同一条归因
+    记录始终基于它登记的指标采样，而不是同名指标的最新值。
     从 metric_values 表获取历史值，计算移动平均和标准差，
     检测当前值是否超出 3-sigma 范围，并按维度拆解贡献度。
     """
     target_name = analysis.get("分析对象", analysis.get("target_name", ""))
     anomaly_time = analysis.get("异常时间点", analysis.get("anomaly_time", db.now()))
     dims_raw = analysis.get("归因维度", analysis.get("attribution_dimensions", "[]"))
+    bound_value_id = analysis.get("metric_value_id")
 
     try:
         dims = json.loads(dims_raw) if isinstance(dims_raw, str) else dims_raw
     except (json.JSONDecodeError, TypeError):
         dims = []
 
-    # 从 metric_values 读取历史
-    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{target_name}%"])
+    bound_value = None
+    if bound_value_id:
+        bound_value = db.fetchone("SELECT * FROM metric_values WHERE id=?", [bound_value_id])
+        if bound_value is None:
+            return {"status": "分析失败", "reason": f"指标采样 {bound_value_id} 已不存在"}
+
+    # 从 metric_values 读取历史：有绑定采样时按它的 metric_id 精确定位
+    if bound_value is not None:
+        metric = db.fetchone("SELECT id FROM metrics WHERE id=?", [bound_value["metric_id"]])
+    elif analysis.get("metric_id"):
+        metric = db.fetchone("SELECT id FROM metrics WHERE id=?", [analysis["metric_id"]])
+    else:
+        metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{target_name}%"])
     if not metric:
         return {"status": "分析失败", "reason": f"未找到指标: {target_name}"}
 
     metric_id = metric["id"]
     all_snapshots = db.fetchall(
-        "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 60",
+        "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC, id DESC LIMIT 60",
         [metric_id],
     )
 
-    if len(all_snapshots) < 10:
+    if bound_value is not None:
+        latest = bound_value["snapshot_value"]
+        # 历史排除证据本身，避免把它算进基线
+        historical = [
+            s["snapshot_value"] for s in all_snapshots
+            if s["id"] != bound_value["id"]
+        ]
+    else:
+        if not all_snapshots:
+            return {"status": "分析失败", "reason": "历史数据不足（< 10 条快照）"}
+        latest = all_snapshots[0]["snapshot_value"]
+        historical = [s["snapshot_value"] for s in all_snapshots[1:]]
+
+    if len(historical) < 2:
         return {"status": "分析失败", "reason": "历史数据不足（< 10 条快照）"}
 
-    values = [s["snapshot_value"] for s in all_snapshots]
-    latest = values[0]
-    historical = values[1:]
     mean_v = statistics.mean(historical)
     std_v = statistics.stdev(historical) if len(historical) > 1 else 0.0001
 
@@ -1013,7 +1037,8 @@ def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
     """检查告警条件是否触发。
 
     从 metric_values 获取最新指标值，对比告警条件判断是否触发，
-    达到连续触发阈值才写入 alert_log。
+    达到连续触发阈值才写入 alert_log。每条触发日志都绑定本次实际使用的
+    metric_value_id，后续归因按这个证据而不是按同名指标或同一分钟去猜。
     """
     alert_id = alert["id"]
     monitor_metric = alert.get("监控指标", alert.get("monitor_metric", ""))
@@ -1021,17 +1046,18 @@ def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
     threshold_raw = alert.get("连续触发次数", alert.get("consecutive_threshold", 3))
     threshold = int(threshold_raw)
 
-    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{monitor_metric}%"])
+    metric = _resolve_metric(alert.get("metric_id"), monitor_metric)
     if not metric:
         return None
 
     latest = db.fetchone(
-        "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
+        "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC, id DESC LIMIT 1",
         [metric["id"]],
     )
     if not latest:
         return None
-
+    latest = dict(latest)
+    latest["metric_name"] = metric["metric_name"]
     current_value = latest["snapshot_value"]
 
     # 解析告警条件
@@ -1070,22 +1096,64 @@ def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
 
     if triggered:
         recent_logs = db.fetchall(
-            "SELECT * FROM alert_log WHERE alert_id=? ORDER BY triggered_at DESC LIMIT ?",
+            "SELECT * FROM alert_log WHERE alert_id=? ORDER BY triggered_at DESC, id DESC LIMIT ?",
             [alert_id, threshold],
         )
+
+        # 同一个采样不重复记触发：连续阈值只在不同的指标采样上累计。
+        already_logged = any(
+            log.get("metric_value_id") == latest["id"] for log in recent_logs)
+        if already_logged:
+            return {"triggered": False, "message": "该指标采样已记录触发"}
 
         resolved_count = sum(1 for l in recent_logs if l["resolved"] == 1)
         if len(recent_logs) >= threshold and resolved_count == 0:
             return {"triggered": True, "message": f"已连续触发{len(recent_logs)}次"}
 
-        log_id = db.insert("alert_log", {
-            "alert_id": alert_id,
-            "metric_value": current_value,
-            "threshold_value": 0,
-        })
+        log_id = record_alert_trigger(alert, latest)
         return {"triggered": False, "log_id": log_id, "message": "已记录，等待连续触发"}
 
     return {"triggered": False, "message": "未触发"}
+
+
+def _resolve_metric(metric_id: Any, monitor_metric: str) -> dict[str, Any] | None:
+    """优先按告警规则绑定的 metric_id 精确定位指标，避免同名/近似名串位。"""
+    if metric_id:
+        metric = db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])
+        if metric:
+            return dict(metric)
+    if not monitor_metric:
+        return None
+    # 精确名称优先，再退回模糊匹配。
+    metric = db.fetchone("SELECT * FROM metrics WHERE metric_name=?", [monitor_metric])
+    if metric:
+        return dict(metric)
+    metric = db.fetchone("SELECT * FROM metrics WHERE metric_name LIKE ? ORDER BY id LIMIT 1",
+                         [f"%{monitor_metric}%"])
+    return dict(metric) if metric else None
+
+
+def record_alert_trigger(
+    alert: dict[str, Any], metric_value: dict[str, Any], triggered_at: str | None = None,
+) -> int:
+    """把一次告警触发连同触发时的指标采样一起落库，返回 alert_log.id。
+
+    证据字段（metric_value_id / metric_id / snapshot_time / rule_id / duty_group）
+    都取触发当时的真实值，之后指标再写入新采样也不会改变这条记录。
+    """
+    return db.insert("alert_log", {
+        "alert_id": alert["id"],
+        "rule_id": alert.get("rule_id", alert.get("id")),
+        "triggered_at": triggered_at or db.now(),
+        "metric_value": metric_value.get("snapshot_value"),
+        "threshold_value": 0,
+        "metric_value_id": metric_value.get("id"),
+        "metric_id": metric_value.get("metric_id", alert.get("metric_id")),
+        "metric_name": metric_value.get("metric_name", alert.get("monitor_metric", "")),
+        "snapshot_time": metric_value.get("snapshot_time", ""),
+        "rule_name": alert.get("rule_name", alert.get("规则名称", "")),
+        "duty_group": alert.get("duty_group", alert.get("归属值班组", "")),
+    })
 
 
 # ============================================================================
@@ -1251,19 +1319,22 @@ def seed_real_data() -> dict[str, int]:
         })
     counts["cubes"] = len(cubes)
 
-    # 告警
+    # 告警：监控指标显式绑定 metric_id，并标注归属值班组（同一指标可被多条规则监控）
     alerts = [
-        ("DAU大幅下降告警", "日活跃用户数(DAU)", "< 100", "email", 3),
-        ("订单量异常告警", "订单总量", "< 50", "sms", 2),
-        ("支付转化率异常告警", "支付转化率", "< 0.1", "dingtalk", 2),
-        ("API调用量暴增告警", "API日均调用量", "> 10000", "email", 1),
-        ("告警触发数异常告警", "告警触发次数(每日)", "> 50", "sms", 2),
+        ("DAU大幅下降告警", "日活跃用户数(DAU)", "< 100", "email", 3, "渠道值班"),
+        ("订单量异常告警", "订单总量", "< 50", "sms", 2, "交易值班"),
+        ("支付转化率异常告警", "支付转化率", "< 0.1", "dingtalk", 2, "收入值班"),
+        ("API调用量暴增告警", "API日均调用量", "> 10000", "email", 1, "渠道值班"),
+        ("告警触发数异常告警", "告警触发次数(每日)", "> 50", "sms", 2, "收入值班"),
     ]
 
-    for name, metric, cond, ch, thresh in alerts:
+    for name, metric, cond, ch, thresh, group in alerts:
+        resolved = _resolve_metric(None, metric)
         db.insert("alerts", {
             "rule_name": name,
             "monitor_metric": metric,
+            "metric_id": resolved["id"] if resolved else None,
+            "duty_group": group,
             "alert_condition": cond,
             "notify_channel": ch,
             "consecutive_threshold": thresh,

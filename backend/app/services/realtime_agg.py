@@ -26,6 +26,8 @@ class RealtimeAggService(BaseModuleService):
     STATUS_ORDER = ["草稿", "已启用", "已停用"]
     ACTION_RULES = {"启用聚合": "已启用", "停用聚合": "已停用"}
     NEGATIVE_ACTIONS = ["停用聚合"]
+    # aggregation_windows.window_type 是 NOT NULL 且无默认值
+    CREATE_DEFAULTS = {"window_type": "tumbling"}
 
     # ================================================================
     # 扩展查询

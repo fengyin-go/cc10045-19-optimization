@@ -15,6 +15,10 @@ class BaseModuleService:
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
+    # 除 LIST_FIELDS 外允许出现在列表查询参数里的字段（中文参数名或英文列名 -> DB 列）。
+    EXTRA_FILTER_COLUMNS: dict[str, str] = {}
+    # 登记时用于补齐目标表 NOT NULL 且无默认值的列。
+    CREATE_DEFAULTS: dict[str, Any] = {}
 
     def _module_table(self) -> str:
         """返回模块主表名，子类可覆盖。"""
@@ -42,16 +46,17 @@ class BaseModuleService:
         }
         return table_map.get(self.MODULE, self.MODULE)
 
-    def list_entries(
+    # ------------------------------------------------------------------
+    # 列表查询
+    # ------------------------------------------------------------------
+    def _build_where(
         self,
         *,
         filters: dict[str, str] | None = None,
         keyword: str | None = None,
         status: str | None = None,
-        page: int = 1,
-        size: int = 20,
-    ) -> tuple[list[dict[str, Any]], int]:
-        table = self._module_table()
+        extra: dict[str, Any] | None = None,
+    ) -> tuple[list[str], list[Any]]:
         where = ["1=1"]
         params: list[Any] = []
 
@@ -70,16 +75,99 @@ class BaseModuleService:
             where.append("status = ?")
             params.append(status)
 
-        where_clause = " AND ".join(where)
-        total = db.count(table, where_clause, params)
-        rows = db.fetchall(
-            f"SELECT * FROM {table} WHERE {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?",
-            params + [size, (page - 1) * size],
+        extra_clauses, extra_params = self._extra_conditions(extra or {})
+        where.extend(extra_clauses)
+        params.extend(extra_params)
+        return where, params
+
+    def _extra_conditions(self, extra: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """把额外过滤参数转换为 SQL 条件；精确匹配，不做名称/时间模糊匹配。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        for key, value in extra.items():
+            if value is None or str(value).strip() == "":
+                continue
+            column = self.EXTRA_FILTER_COLUMNS.get(key)
+            if column is None:
+                continue
+            clauses.append(f"{column} = ?")
+            params.append(_coerce(value))
+        return clauses, params
+
+    def list_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        size: int = 20,
+        extra: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        items, total, _ = self.list_entries_page(
+            filters=filters, keyword=keyword, status=status,
+            page=page, size=size, extra=extra,
         )
-        return rows, total
+        return items, total
+
+    def list_entries_page(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        size: int = 20,
+        extra: dict[str, Any] | None = None,
+        anchor_id: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int, int]:
+        """分页查询，带稳定锚点。
+
+        anchor_id 是首次查询时结果集的 id 上界。后续翻页始终只取 ``id <= anchor_id``
+        的记录，因此翻页期间新插入的样本不会挤动已经看过的页。
+        """
+        table = self._module_table()
+        where, params = self._build_where(
+            filters=filters, keyword=keyword, status=status, extra=extra)
+        base_clause = " AND ".join(where)
+
+        if anchor_id is None:
+            row = db.fetchone(
+                f"SELECT COALESCE(MAX(id), 0) AS anchor FROM {table} WHERE {base_clause}",
+                params,
+            )
+            anchor_id = int(row["anchor"]) if row else 0
+
+        page_where = f"{base_clause} AND id <= ?"
+        page_params = params + [anchor_id]
+        total = db.count(table, page_where, page_params)
+        rows = db.fetchall(
+            f"SELECT * FROM {table} WHERE {page_where} "
+            "ORDER BY id DESC LIMIT ? OFFSET ?",
+            page_params + [size, (page - 1) * size],
+        )
+        return [self._row_view(row) for row in rows], total, anchor_id
+
+    def _row_view(self, row: dict[str, Any]) -> dict[str, Any]:
+        """把数据库列名补成前端可直接展示的中文字段。"""
+        view = dict(row)
+        for field in self.LIST_FIELDS:
+            column = _to_column_name(field)
+            if field not in view:
+                view[field] = row.get(column, "")
+        view["status"] = row.get("status", view.get("status", ""))
+        view["pending"] = view["status"] not in (
+            "已停用", "已下线", "已归档", "已冻结", "已过期", "已关闭", "已暂停")
+        view["abnormal"] = view["status"] in ("有异常", "分析失败", "导出失败", "计算失败",
+                                              "执行失败", "超时终止")
+        return view
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
         return db.fetchone(f"SELECT * FROM {self._module_table()} WHERE id=?", [entry_id])
+
+    def get_entry_view(self, entry_id: int) -> dict[str, Any] | None:
+        entry = self.get_entry(entry_id)
+        return self._row_view(entry) if entry else None
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [
@@ -90,19 +178,22 @@ class BaseModuleService:
             return None, missing
 
         table = self._module_table()
-        data: dict[str, Any] = {}
+        data: dict[str, Any] = dict(self.CREATE_DEFAULTS)
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
             data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
-            data["name"] = values.get(self.LIST_FIELDS[0], "")
         data["status"] = self.STATUS_ORDER[0]
 
         entry_id = db.insert(table, data)
         entry = db.fetchone(f"SELECT * FROM {table} WHERE id=?", [entry_id])
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = self.get_entry(entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
@@ -127,6 +218,14 @@ class BaseModuleService:
             "by_status": by_status,
             "abnormal": 0,
         }
+
+
+def _coerce(value: Any) -> Any:
+    """过滤参数来自 HTTP query，数字列需要还原成整数。"""
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return text
 
 
 def _to_column_name(chinese_field: str) -> str:

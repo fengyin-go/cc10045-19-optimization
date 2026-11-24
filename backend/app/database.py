@@ -197,8 +197,41 @@ DDL_STATEMENTS = [
         contribution_ranking TEXT DEFAULT '{}',
         conclusion TEXT,
         status TEXT NOT NULL DEFAULT '待分析',
+        metric_id INTEGER,
+        metric_name TEXT NOT NULL DEFAULT '',
+        metric_value_id INTEGER,
+        snapshot_time TEXT NOT NULL DEFAULT '',
+        snapshot_value REAL,
+        rule_id INTEGER,
+        rule_name TEXT NOT NULL DEFAULT '',
+        duty_group TEXT NOT NULL DEFAULT '',
+        evidence_source TEXT NOT NULL DEFAULT '',
+        handler TEXT NOT NULL DEFAULT '',
+        claimed_from_id INTEGER,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
+    # 归因记录与告警证据的绑定关系单独成表：一个告警证据可以被多条归因记录引用，
+    # 每条归因记录各自保存它当时实际取用的指标采样（metric_value_id），互不覆盖。
+    """CREATE TABLE IF NOT EXISTS anomaly_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        analysis_id INTEGER NOT NULL,
+        alert_log_id INTEGER NOT NULL,
+        rule_id INTEGER,
+        rule_name TEXT NOT NULL DEFAULT '',
+        duty_group TEXT NOT NULL DEFAULT '',
+        metric_value_id INTEGER NOT NULL,
+        metric_id INTEGER,
+        metric_name TEXT NOT NULL DEFAULT '',
+        snapshot_time TEXT NOT NULL DEFAULT '',
+        snapshot_value REAL,
+        source TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (analysis_id) REFERENCES anomaly_analyses(id),
+        FOREIGN KEY (alert_log_id) REFERENCES alert_log(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_ae_analysis ON anomaly_evidence(analysis_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ae_log ON anomaly_evidence(alert_log_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_ae_analysis_log ON anomaly_evidence(analysis_id, alert_log_id)",
 
     # ==================== Forecast Tier ====================
     """CREATE TABLE IF NOT EXISTS forecast_tasks (
@@ -261,6 +294,8 @@ DDL_STATEMENTS = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         rule_name TEXT NOT NULL,
         monitor_metric TEXT NOT NULL,
+        metric_id INTEGER,
+        duty_group TEXT NOT NULL DEFAULT '',
         alert_condition TEXT NOT NULL,
         notify_channel TEXT DEFAULT '',
         consecutive_threshold INTEGER NOT NULL DEFAULT 3,
@@ -271,12 +306,21 @@ DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS alert_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         alert_id INTEGER NOT NULL,
+        rule_id INTEGER,
         triggered_at TEXT NOT NULL DEFAULT (datetime('now')),
         metric_value REAL,
         threshold_value REAL,
+        metric_value_id INTEGER,
+        metric_id INTEGER,
+        metric_name TEXT DEFAULT '',
+        snapshot_time TEXT DEFAULT '',
+        rule_name TEXT DEFAULT '',
+        duty_group TEXT NOT NULL DEFAULT '',
         resolved INTEGER DEFAULT 0,
         FOREIGN KEY (alert_id) REFERENCES alerts(id)
     )""",
+    "CREATE INDEX IF NOT EXISTS idx_alert_log_rule ON alert_log(alert_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_alert_log_evidence ON alert_log(metric_value_id, id)",
 
     """CREATE TABLE IF NOT EXISTS query_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,6 +400,50 @@ DDL_STATEMENTS = [
 ]
 
 
+_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {    "alerts": {
+        "metric_id": "INTEGER",
+        "duty_group": "TEXT NOT NULL DEFAULT ''",
+    },
+    "alert_log": {
+        "rule_id": "INTEGER",
+        "metric_value_id": "INTEGER",
+        "metric_id": "INTEGER",
+        "metric_name": "TEXT DEFAULT ''",
+        "snapshot_time": "TEXT DEFAULT ''",
+        "rule_name": "TEXT DEFAULT ''",
+        "duty_group": "TEXT NOT NULL DEFAULT ''",
+    },
+    "anomaly_analyses": {
+        "metric_id": "INTEGER",
+        "metric_name": "TEXT NOT NULL DEFAULT ''",
+        "metric_value_id": "INTEGER",
+        "snapshot_time": "TEXT NOT NULL DEFAULT ''",
+        "snapshot_value": "REAL",
+        "rule_id": "INTEGER",
+        "rule_name": "TEXT NOT NULL DEFAULT ''",
+        "duty_group": "TEXT NOT NULL DEFAULT ''",
+        "evidence_source": "TEXT NOT NULL DEFAULT ''",
+        "handler": "TEXT NOT NULL DEFAULT ''",
+        "claimed_from_id": "INTEGER",
+    },
+}
+
+
+def _is_index_stmt(stmt: str) -> bool:
+    return "CREATE INDEX" in stmt.upper() or "CREATE UNIQUE INDEX" in stmt.upper()
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    """对已存在的旧库补齐新增列，避免升级后读写旧表失败。"""
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
+        for column, ddl in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 class AnalyticsDB:
     """SQLite-backed analytics database with connection pooling and WAL mode."""
 
@@ -371,7 +459,14 @@ class AnalyticsDB:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-        for stmt in DDL_STATEMENTS:
+        # 先建表（旧库上是 no-op），补列后再建索引：
+        # 旧库的表可能缺少新索引引用的列，直接建索引会报 no such column。
+        table_stmts = [s for s in DDL_STATEMENTS if not _is_index_stmt(s)]
+        index_stmts = [s for s in DDL_STATEMENTS if _is_index_stmt(s)]
+        for stmt in table_stmts:
+            conn.execute(stmt)
+        _migrate_columns(conn)
+        for stmt in index_stmts:
             conn.execute(stmt)
         conn.commit()
         conn.close()
